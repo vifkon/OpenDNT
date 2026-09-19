@@ -62,7 +62,8 @@ go run . -mode=dial
 ## Стек
 
 - Язык: Go
-- Планируемые библиотеки: `refraction-networking/utls`
+- `flynn/noise` - Noise_XX хендшейк и шифрование
+- `refraction-networking/utls` - TCP-транспорт с ClientHello под браузер
 
 ## Donutы на мои кошелёчки
 

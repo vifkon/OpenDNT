@@ -22,10 +22,11 @@ func main() {
 
 	fmt.Println("OpenDNT узел запущен, режим:", *mode)
 
+	in := newStdin()
 	if *mode == "listen" {
-		err = runServer(cs, staticKeypair)
+		err = runServer(cs, staticKeypair, in)
 	} else {
-		err = runClient(cs, staticKeypair)
+		err = runClient(cs, staticKeypair, in)
 	}
 
 	if err != nil {
