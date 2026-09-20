@@ -12,8 +12,7 @@ import (
 	"github.com/flynn/noise"
 )
 
-// handshakeTimeout - сколько даём собеседнику на TLS + Noise_XX. Кто не
-// уложился - не наш узел (или сканер, который держит сокет открытым)
+// handshakeTimeout - сколько даём собеседнику на TLS + Noise_XX. Кто не уложился - не наш узел
 const handshakeTimeout = 5 * time.Second
 
 // peer - соединение, уже прошедшее хендшейк, вместе с ключами
@@ -22,13 +21,9 @@ type peer struct {
 	send, recv *noise.CipherState
 }
 
-// runServer поднимает TLS listener на :9000. Accept-цикл крутится в
-// отдельной горутине, а каждое входящее соединение проходит хендшейк в
-// СВОЕЙ горутине: медленный или молчащий клиент (сканер) не может
-// заблокировать приём остальных. Первый, кто реально прошёл Noise_XX,
-// попадает в канал ready, и с ним запускается чат
-
-// позже будет многопирный режим, но пока что это просто один пир
+// runServer - режим чата: ждём первого пира, прошедшего хендшейк.
+// Что делать с пиром после хендшейка, решает onPeer, поэтому политика
+// "первый выигрывает" живёт здесь, а не в общем коде приёма
 func runServer(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader) error {
 	ln, err := listenUTLS(":9000")
 	if err != nil {
@@ -37,22 +32,27 @@ func runServer(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader
 	defer ln.Close()
 	fmt.Println("Слушаем на :9000, ждём соединения...")
 
-	// буфер 1: победитель кладёт пира, не дожидаясь, пока main дойдёт
-	// до чтения из канала
+	// буфер 1: победитель кладёт пира, не дожидаясь, пока main дойдёт до чтения из канала
 	ready := make(chan peer, 1)
-	go acceptLoop(ln, cs, staticKeypair, ready)
+	go acceptLoop(ln, cs, staticKeypair, func(p peer) {
+		select {
+		case ready <- p:
+		default:
+			fmt.Println("Пир уже подключён, отбрасываем:", p.conn.RemoteAddr())
+			p.conn.Close()
+		}
+	})
 
 	p := <-ready
 	defer p.conn.Close()
 	return runChat(p.conn, p.send, p.recv, in)
 }
 
-// acceptLoop принимает соединения, пока listener не закроют
-func acceptLoop(ln net.Listener, cs noise.CipherSuite, kp noise.DHKey, ready chan<- peer) {
+// acceptLoop принимает соединения, пока listener не закроют. Каждое соединение обрабатывается в своей горутине
+func acceptLoop(ln net.Listener, cs noise.CipherSuite, kp noise.DHKey, onPeer func(peer)) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// listener закрыт (runServer вернулся) - выходим
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
@@ -61,13 +61,13 @@ func acceptLoop(ln net.Listener, cs noise.CipherSuite, kp noise.DHKey, ready cha
 			continue
 		}
 		fmt.Println("Подключение принято от:", conn.RemoteAddr())
-		go serveConn(conn, cs, kp, ready)
+		go serveConn(conn, cs, kp, onPeer)
 	}
 }
 
-// serveConn прогоняет одно входящее соединение через хендшейк. Всё, что
-// не говорит на нашем протоколе (браузер, сканер порта), просто отбрасывается
-func serveConn(conn net.Conn, cs noise.CipherSuite, kp noise.DHKey, ready chan<- peer) {
+// serveConn прогоняет одно входящее соединение через хендшейк и отдаёт
+// готового пира в onPeer. Всё, что не говорит на нашем протоколе, просто отбрасывается
+func serveConn(conn net.Conn, cs noise.CipherSuite, kp noise.DHKey, onPeer func(peer)) {
 	// дедлайн только на этап хендшейка. TLS-хендшейк у crypto/tls ленивый
 	// и случается внутри первого чтения, так что дедлайн покрывает и его
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -78,23 +78,15 @@ func serveConn(conn net.Conn, cs noise.CipherSuite, kp noise.DHKey, ready chan<-
 		conn.Close()
 		return
 	}
-	conn.SetDeadline(time.Time{}) // хендшейк наш - для чата дедлайн снимаем
+	conn.SetDeadline(time.Time{}) // хендшейк наш - дальше дедлайн снимаем
 
-	select {
-	case ready <- peer{conn: conn, send: send, recv: recv}:
-	default:
-		// пир уже есть (одновременно прошли хендшейк двое) - лишнего закрываем
-		fmt.Println("Пир уже подключён, отбрасываем:", conn.RemoteAddr())
-		conn.Close()
-	}
+	// onPeer блокирующий: для релейки он живёт столько же, сколько пир
+	onPeer(peer{conn: conn, send: send, recv: recv})
 }
 
-// проводит соединение через handshake + chat
+// runClient проводит соединение через handshake + chat
 func runClient(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader) error {
 	fmt.Print("Введите айпи: ")
-	// читаем строку целиком тем же readerом, что потом уйдёт в чат: так
-	// перевод строки после IP не остаётся в stdin и не превращается в
-	// пустое первое сообщение (fmt.Scan забирал только слово)
 	line, err := in.ReadString('\n')
 	if err != nil {
 		return err
