@@ -9,6 +9,8 @@ import (
 func main() {
 	mode := flag.String("mode", "listen", "listen, dial или relay")
 	keyPath := flag.String("key", "node.key", "путь к файлу с приватным ключом")
+	relayAddr := flag.String("relayaddr", "", "только для dial: ip:порт релея, через который идти к конечному узлу")
+	addr := flag.String("addr", "", "ip:порт: для listen/relay адрес прослушивания (по умолчанию :9000), для dial адрес назначения")
 	flag.Parse()
 
 	// режим проверяем ДО загрузки ключа: опечатка не должна создавать файл ключа
@@ -17,6 +19,19 @@ func main() {
 	default:
 		fmt.Println("Неправильный режим. Юзай 'listen', 'dial' или 'relay'.")
 		return
+	}
+
+	if *relayAddr != "" && *mode != "dial" {
+		fmt.Println("-relayaddr работает только с -mode dial")
+		return
+	}
+
+	if *addr == "" {
+		if *mode == "dial" {
+			fmt.Println("Для режима dial нужен -addr ip:порт")
+			return
+		}
+		*addr = ":9000"
 	}
 
 	cs := newCipherSuite()
@@ -31,11 +46,15 @@ func main() {
 	in := newStdin()
 	switch *mode {
 	case "listen":
-		err = runServer(cs, staticKeypair, in)
+		err = runServer(cs, staticKeypair, in, *addr)
 	case "dial":
-		err = runClient(cs, staticKeypair, in)
+		if *relayAddr != "" {
+			err = runClientViaRelay(cs, staticKeypair, in, *relayAddr, *addr)
+		} else {
+			err = runClient(cs, staticKeypair, in, *addr)
+		}
 	case "relay":
-		err = runRelay(cs, staticKeypair)
+		err = runRelay(cs, staticKeypair, *addr)
 	}
 
 	if err != nil {

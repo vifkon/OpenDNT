@@ -1,4 +1,4 @@
 /compiled/
-node.key
 *.key
+keys/*
 keysfoldertest/

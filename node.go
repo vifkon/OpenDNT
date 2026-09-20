@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/flynn/noise"
@@ -24,13 +23,13 @@ type peer struct {
 // runServer - режим чата: ждём первого пира, прошедшего хендшейк.
 // Что делать с пиром после хендшейка, решает onPeer, поэтому политика
 // "первый выигрывает" живёт здесь, а не в общем коде приёма
-func runServer(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader) error {
-	ln, err := listenUTLS(":9000")
+func runServer(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader, addr string) error {
+	ln, err := listenUTLS(addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
-	fmt.Println("Слушаем на :9000, ждём соединения...")
+	fmt.Println("Слушаем на", addr, ", ждём соединения...")
 
 	// буфер 1: победитель кладёт пира, не дожидаясь, пока main дойдёт до чтения из канала
 	ready := make(chan peer, 1)
@@ -85,18 +84,7 @@ func serveConn(conn net.Conn, cs noise.CipherSuite, kp noise.DHKey, onPeer func(
 }
 
 // runClient проводит соединение через handshake + chat
-func runClient(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader) error {
-	fmt.Print("Введите айпи: ")
-	line, err := in.ReadString('\n')
-	if err != nil {
-		return err
-	}
-	ip := strings.TrimSpace(line)
-	if ip == "" {
-		return errors.New("пустой айпи")
-	}
-
-	addr := fmt.Sprintf("%s:9000", ip)
+func runClient(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader, addr string) error {
 	conn, err := dialUTLS(addr)
 	if err != nil {
 		return err
