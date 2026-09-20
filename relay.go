@@ -2,15 +2,15 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
-	"io"
-	"strings"
-	"time"
+	"net"
 
 	"github.com/flynn/noise"
 )
 
+// runRelay - слушаем и принимаем клиентов. cs и kp нужны только для хендшейка
+// клиент<->релей, его делает acceptLoop. С целью релей Noise больше не
+// говорит вообще - см. handleRelayPeer
 func runRelay(cs noise.CipherSuite, kp noise.DHKey, addr string) error {
 	ln, err := listenUTLS(addr)
 	if err != nil {
@@ -19,11 +19,16 @@ func runRelay(cs noise.CipherSuite, kp noise.DHKey, addr string) error {
 	defer ln.Close()
 	fmt.Println("Релей слушает на", addr)
 
-	acceptLoop(ln, cs, kp, func(p peer) { handleRelayPeer(p, cs, kp) })
+	acceptLoop(ln, cs, kp, handleRelayPeer)
 	return nil
 }
 
-func handleRelayPeer(p peer, cs noise.CipherSuite, kp noise.DHKey) {
+// handleRelayPeer: ждём CONNECT, открываем только TLS до цели и дальше просто
+// гоним байты туда-сюда. Раньше релей сам делал Noise с целью и
+// перешифровывал всё - то есть видел весь плейнтекст, чего мы и не хотели.
+// Теперь Noise клиент<->цель едет внутри DATA как обычные байты, и
+// расшифровать их релей не может - у него нет тех ключей
+func handleRelayPeer(p peer) {
 	defer p.conn.Close()
 
 	typ, payload, err := recvCmd(p)
@@ -45,31 +50,24 @@ func handleRelayPeer(p peer, cs noise.CipherSuite, kp noise.DHKey) {
 	}
 	defer out.Close()
 
-	out.SetDeadline(time.Now().Add(handshakeTimeout))
-	recv, send, err := handshakeClient(out, cs, kp)
-	if err != nil {
-		sendCmd(p, cmdErr, []byte(err.Error()))
-		return
-	}
-	out.SetDeadline(time.Time{})
-	next := peer{conn: out, send: send, recv: recv}
-
 	if err := sendCmd(p, cmdOK, nil); err != nil {
 		return
 	}
 	fmt.Println("Релей: соединение с", target, "установлено")
 
 	errc := make(chan error, 2)
-	go func() { errc <- forwardToTarget(p, next) }()
-	go func() { errc <- forwardToClient(next, p) }()
+	go func() { errc <- pipeToTarget(p, out) }()
+	go func() { errc <- pipeToClient(out, p) }()
 
 	err = <-errc
 	fmt.Println("Релей: закрываем", target, "-", err)
-	// defer закроет оба соединения, и по иттогу вторая горутина завершится с ошибкой чтения
+	// deferы закроют оба соединения, и вторая горутина по итогу вылетит с ошибкой чтения
 }
 
-// forwardToTarget: команда DATA от клиента -> перешифровать -> цели
-func forwardToTarget(from, to peer) error {
+// pipeToTarget: DATA от клиента -> достаём байты -> в цель как есть
+// вкратце это чужой Noise, внутри фреймы
+// со своим префиксом длины, релею туда лезть незачем
+func pipeToTarget(from peer, to net.Conn) error {
 	for {
 		typ, payload, err := recvCmd(from)
 		if err != nil {
@@ -78,32 +76,30 @@ func forwardToTarget(from, to peer) error {
 		if typ != cmdData {
 			return fmt.Errorf("неожиданная команда %d", typ)
 		}
-		ct, err := to.send.Encrypt(nil, nil, payload)
-		if err != nil {
+		if _, err := to.Write(payload); err != nil {
 			return err
 		}
-		if err := writeFrame(to.conn, ct); err != nil {
-			return err
-		}
-		fmt.Printf("Релей: %s -> %s, %d байт\n", from.conn.RemoteAddr(), to.conn.RemoteAddr(), len(payload))
+		// первые байты в hex - чисто чтобы глазами убедиться, что там каша, а не текст
+		fmt.Printf("Релей: клиент -> цель, %d байт, начало: %x\n", len(payload), payload[:min(len(payload), 16)])
 	}
 }
 
-// forwardToClient: фрейм от цели -> расшифровать -> завернуть в DATA -> клиенту
-func forwardToClient(from, to peer) error {
+// pipeToClient: что прочитали из цели -> заворачиваем в DATA -> клиенту.
+// Читаем поток кусками, не фреймами: где кончается сообщение, знает только
+// клиент, релей этого не видит и не должен
+func pipeToClient(from net.Conn, to peer) error {
+	buf := make([]byte, maxChunk)
 	for {
-		ct, err := readFrame(from.conn)
+		n, err := from.Read(buf)
+		if n > 0 {
+			if err := sendCmd(to, cmdData, buf[:n]); err != nil {
+				return err
+			}
+			fmt.Printf("Релей: цель -> клиент, %d байт, начало: %x\n", n, buf[:min(n, 16)])
+		}
 		if err != nil {
 			return err
 		}
-		pt, err := from.recv.Decrypt(nil, nil, ct)
-		if err != nil {
-			return err
-		}
-		if err := sendCmd(to, cmdData, pt); err != nil {
-			return err
-		}
-		fmt.Printf("Релей: %s -> %s, %d байт\n", from.conn.RemoteAddr(), to.conn.RemoteAddr(), len(pt))
 	}
 }
 
@@ -116,6 +112,7 @@ func runClientViaRelay(cs noise.CipherSuite, kp noise.DHKey, in *bufio.Reader, r
 	defer conn.Close()
 	fmt.Println("Подключился к релею", relayAddr)
 
+	// хендшейк №1: клиент <-> релей, это линк
 	recv, send, err := handshakeClient(conn, cs, kp)
 	if err != nil {
 		return err
@@ -138,61 +135,12 @@ func runClientViaRelay(cs noise.CipherSuite, kp noise.DHKey, in *bufio.Reader, r
 		return fmt.Errorf("неожиданный ответ релея: %d", typ)
 	}
 
-	return chatViaRelay(p, in)
-}
-
-// chatViaRelay - тот же чат, что runChat, но поверх команд DATA
-func chatViaRelay(p peer, in *bufio.Reader) error {
-	netDone := make(chan error, 1)
-	go func() {
-		for {
-			typ, payload, err := recvCmd(p)
-			if err != nil {
-				netDone <- err
-				return
-			}
-			if typ == cmdData {
-				fmt.Println("\nСобеседник:", string(payload))
-				fmt.Print("Введите сообщение: ")
-			}
-		}
-	}()
-
-	lines := make(chan string)
-	inErr := make(chan error, 1)
-	go func() {
-		for {
-			text, err := in.ReadString('\n')
-			if err != nil {
-				inErr <- err
-				return
-			}
-			lines <- strings.TrimRight(text, "\r\n")
-		}
-	}()
-
-	for {
-		fmt.Print("Введите сообщение: ")
-		select {
-		case text := <-lines:
-			// +1 байт на тип команды; проверяем до Encrypt
-			if len(text)+1 > maxPlaintext {
-				fmt.Println("Слишком длинное сообщение")
-				continue
-			}
-			if err := sendCmd(p, cmdData, []byte(text)); err != nil {
-				return err
-			}
-		case err := <-netDone:
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		case err := <-inErr:
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
+	// хендшейк №2: клиент <-> цель, СКВОЗЬ релей. Дальше все ключи с
+	// префиксом e2e - это ключи цели, релей их не знает
+	rc := newRelayConn(p)
+	e2eRecv, e2eSend, err := handshakeClient(rc, cs, kp)
+	if err != nil {
+		return err
 	}
+	return runChat(rc, e2eSend, e2eRecv, in)
 }
