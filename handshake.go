@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 
@@ -67,7 +68,10 @@ func handshakeServer(conn net.Conn, cs noise.CipherSuite, staticKeypair noise.DH
 }
 
 // handshakeClient — инициирующая (initiator) сторона того же Noise_XX.
-func handshakeClient(conn net.Conn, cs noise.CipherSuite, staticKeypair noise.DHKey) (recv, send *noise.CipherState, err error) {
+// expectedPeer - закреплённый (pinned) публичный ключ собеседника. nil значит
+// "не проверяем", и тогда подменить собеседника может кто угодно на пути:
+// XX сам по себе про ключ собеседника заранее ничего не знает
+func handshakeClient(conn net.Conn, cs noise.CipherSuite, staticKeypair noise.DHKey, expectedPeer []byte) (recv, send *noise.CipherState, err error) {
 	config := noise.Config{
 		CipherSuite:   cs,
 		Pattern:       noise.HandshakeXX,
@@ -97,6 +101,14 @@ func handshakeClient(conn net.Conn, cs noise.CipherSuite, staticKeypair noise.DH
 		return nil, nil, err
 	}
 	fmt.Println("Получено handshake-сообщение 2 (<- e, ee, s, es), байт:", len(msg2))
+
+	// сверяем ключ ДО отправки msg3: в нём уезжает НАШ статический ключ, и
+	// отдавать его тому, кто подсунул левый ключ (MITM), нельзя. Заодно
+	// подделать ответ с настоящим ключом цели не выйдет: без её приватника
+	// тег msg2 не сойдётся и ReadMessage выше уже вернул бы ошибку
+	if expectedPeer != nil && !bytes.Equal(hs.PeerStatic(), expectedPeer) {
+		return nil, nil, fmt.Errorf("ключ собеседника не совпал с закреплённым: пришёл %x, ждали %x", hs.PeerStatic(), expectedPeer)
+	}
 
 	msg3, sendCS, recvCS, err := hs.WriteMessage(nil, nil)
 	if err != nil {

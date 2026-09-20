@@ -83,8 +83,9 @@ func serveConn(conn net.Conn, cs noise.CipherSuite, kp noise.DHKey, onPeer func(
 	onPeer(peer{conn: conn, send: send, recv: recv})
 }
 
-// runClient проводит соединение через handshake + chat
-func runClient(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader, addr string) error {
+// runClient проводит соединение через handshake + chat. targetKey - закреплённый
+// ключ собеседника (nil - не проверяем)
+func runClient(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader, addr string, targetKey []byte) error {
 	conn, err := dialUTLS(addr)
 	if err != nil {
 		return err
@@ -92,7 +93,7 @@ func runClient(cs noise.CipherSuite, staticKeypair noise.DHKey, in *bufio.Reader
 	defer conn.Close()
 	fmt.Println("Подключился к", addr)
 
-	recv, send, err := handshakeClient(conn, cs, staticKeypair)
+	recv, send, err := handshakeClient(conn, cs, staticKeypair, targetKey)
 	if err != nil {
 		return err
 	}
