@@ -14,6 +14,9 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+// dialTimeout - сколько ждём TCP + TLS до собеседника. Не ответил - считаем недоступным
+const dialTimeout = 10 * time.Second
+
 // generateSelfSignedCert создаёт эфемерный сертификат прямо в памяти,
 // без диска и без CA. Живёт один запуск процесса - тот же паттерн
 // упрощения, что уже есть у статического Noise-ключа в keys.go
@@ -66,7 +69,7 @@ func listenUTLS(addr string) (net.Listener, error) {
 // реальный браузер. Для DPI это выглядит как рядовой HTTPS, а не как
 // самодельный golang-TLS-стек
 func dialUTLS(addr string) (net.Conn, error) {
-	rawConn, err := net.Dial("tcp", addr)
+	rawConn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +85,14 @@ func dialUTLS(addr string) (net.Conn, error) {
 		InsecureSkipVerify: true,
 	}
 
+	// DialTimeout покрывает только TCP, а TLS-хендшейк с молчащим сервером
+	// висел бы вечно - поэтому на него отдельный дедлайн, после хендшейка снимаем
+	rawConn.SetDeadline(time.Now().Add(dialTimeout))
 	uConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
 	if err := uConn.Handshake(); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
+	rawConn.SetDeadline(time.Time{})
 	return uConn, nil
 }

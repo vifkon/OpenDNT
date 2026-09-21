@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"strings"
 )
 
@@ -14,6 +15,7 @@ func main() {
 	relayAddr := flag.String("relayaddr", "", "только для dial: ip:порт релея, через который идти к конечному узлу")
 	addr := flag.String("addr", "", "ip:порт: для listen/relay адрес прослушивания (по умолчанию :9000), для dial адрес назначения")
 	targetKeyHex := flag.String("targetkey", "", "только для dial: публичный ключ цели (hex, строка 'Публичный ключ' у неё в логе); если ключ в хендшейке другой - рвём соединение")
+	allowStr := flag.String("allow", "", "только для relay: список целей через запятую (ip:порт,ip:порт), к которым релей вообще согласен подключаться; без флага релей открытый")
 	flag.Parse()
 
 	// режим проверяем ДО загрузки ключа: опечатка не должна создавать файл ключа
@@ -27,6 +29,23 @@ func main() {
 	if *relayAddr != "" && *mode != "dial" {
 		fmt.Println("-relayaddr работает только с -mode dial")
 		return
+	}
+
+	if *allowStr != "" && *mode != "relay" {
+		fmt.Println("-allow работает только с -mode relay")
+		return
+	}
+	var allow map[netip.AddrPort]bool
+	if *allowStr != "" {
+		a, aErr := parseAllowList(*allowStr)
+		if aErr != nil {
+			fmt.Println("-allow:", aErr)
+			return
+		}
+		allow = a
+	}
+	if *mode == "relay" && allow == nil {
+		fmt.Println("Внимание: -allow не задан, релей открытый (пустит к любой цели)")
 	}
 
 	if *targetKeyHex != "" && *mode != "dial" {
@@ -74,7 +93,7 @@ func main() {
 			err = runClient(cs, staticKeypair, in, *addr, targetKey)
 		}
 	case "relay":
-		err = runRelay(cs, staticKeypair, *addr)
+		err = runRelay(cs, staticKeypair, *addr, allow)
 	}
 
 	if err != nil {

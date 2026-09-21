@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 
 	"github.com/flynn/noise"
 )
@@ -11,7 +13,7 @@ import (
 // runRelay - слушаем и принимаем клиентов. cs и kp нужны только для хендшейка
 // клиент<->релей, его делает acceptLoop. С целью релей Noise больше не
 // говорит вообще - см. handleRelayPeer
-func runRelay(cs noise.CipherSuite, kp noise.DHKey, addr string) error {
+func runRelay(cs noise.CipherSuite, kp noise.DHKey, addr string, allow map[netip.AddrPort]bool) error {
 	ln, err := listenUTLS(addr)
 	if err != nil {
 		return err
@@ -19,7 +21,7 @@ func runRelay(cs noise.CipherSuite, kp noise.DHKey, addr string) error {
 	defer ln.Close()
 	fmt.Println("Релей слушает на", addr)
 
-	acceptLoop(ln, cs, kp, handleRelayPeer)
+	acceptLoop(ln, cs, kp, func(p peer) { handleRelayPeer(p, allow) })
 	return nil
 }
 
@@ -28,7 +30,7 @@ func runRelay(cs noise.CipherSuite, kp noise.DHKey, addr string) error {
 // перешифровывал всё - то есть видел весь плейнтекст, чего мы и не хотели.
 // Теперь Noise клиент<->цель едет внутри DATA как обычные байты, и
 // расшифровать их релей не может - у него нет тех ключей
-func handleRelayPeer(p peer) {
+func handleRelayPeer(p peer, allow map[netip.AddrPort]bool) {
 	defer p.conn.Close()
 
 	typ, payload, err := recvCmd(p)
@@ -42,6 +44,14 @@ func handleRelayPeer(p peer) {
 	}
 	target := string(payload)
 	fmt.Println("Релей: просят подключиться к", target)
+
+	// allow == nil - список не задан, релей открытый (main.go про это предупредил).
+	// Иначе пускаем только точное совпадение ip:port из списка
+	if allow != nil && !targetAllowed(allow, target) {
+		fmt.Println("Релей: цель не в allow-list, отказ:", target)
+		sendCmd(p, cmdErr, []byte("цель не разрешена"))
+		return
+	}
 
 	out, err := dialUTLS(target)
 	if err != nil {
@@ -62,6 +72,38 @@ func handleRelayPeer(p peer) {
 	err = <-errc
 	fmt.Println("Релей: закрываем", target, "-", err)
 	// deferы закроют оба соединения, и вторая горутина по итогу вылетит с ошибкой чтения
+}
+
+// parseAllowList разбирает строку "ip:port,ip:port" из флага -allow.
+// Только IP, без доменов: домен релею пришлось бы резолвить самому, а это лишний
+// канал для подмены (DNS) и лишний повод для утечки
+func parseAllowList(s string) (map[netip.AddrPort]bool, error) {
+	allow := make(map[netip.AddrPort]bool)
+	for _, item := range strings.Split(s, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		ap, err := netip.ParseAddrPort(item)
+		if err != nil {
+			return nil, fmt.Errorf("%q: нужен ip:порт, домены нельзя (%v)", item, err)
+		}
+		allow[netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())] = true
+	}
+	if len(allow) == 0 {
+		return nil, fmt.Errorf("список пустой")
+	}
+	return allow, nil
+}
+
+// targetAllowed: цель от клиента должна разобраться как ip:порт и совпасть
+// со списком. Всё, что не разобралось (в том числе домен), - отказ
+func targetAllowed(allow map[netip.AddrPort]bool, target string) bool {
+	ap, err := netip.ParseAddrPort(target)
+	if err != nil {
+		return false
+	}
+	return allow[netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())]
 }
 
 // pipeToTarget: DATA от клиента -> достаём байты -> в цель как есть
